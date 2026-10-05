@@ -582,6 +582,11 @@ const HASH_ROOM = 'room';
 const ROOM_KEY_STORE = 'cue-room-keys'; // { 房间码: 控制密钥 }，创建者刷新后仍可控制
 const ROOM_POLL_MS = 1000;
 
+// 房间会话代次：每次进入房间（含离开后重新加入，甚至同一房间码）递增。异步轮询/
+// 控制响应返回时据此确认「仍属于发起请求时的那次房间会话」，避免离开后的旧响应
+// 写进新加入的房间（含同房间码重新加入的会话）。
+let roomJoinSeq = 0;
+
 function loadRoomKeyStore() {
   try {
     return JSON.parse(localStorage.getItem(ROOM_KEY_STORE) || '{}');
@@ -596,9 +601,11 @@ function saveRoomKey(code, key) {
   localStorage.setItem(ROOM_KEY_STORE, JSON.stringify(store));
 }
 
-state.room = null; // { view, session, key, clock, pollTimer, rafId, progRows }
+state.room = null; // { view, session, key, clock, joinId, pollTimer, rafId, progRows }
 // clock：RoomClock 校时锚点（server_wall/server_time + 本机单调时刻），
 // 轮询暂时失败期间继续按最近一次有效锚点推进，恢复后重新校准。
+// joinId：本次房间会话代次；只有仍属于当前房间会话、且按 (revision, server_wall)
+// 偏序不早于已接纳状态的响应才允许覆写 view 与校时锚点（RoomView 接纳顺序）。
 
 // 循环排演编辑器的段行（主持人本地草稿，未提交不影响房间）
 function defaultProgRow() {
@@ -668,8 +675,13 @@ $('btn-room-copy-code').addEventListener('click', async () => {
 // 加入房间：拉取服务端状态 + 固定版本快照（之后草稿/新发布不影响本房间）
 async function enterRoom(code, key, initialView) {
   clearErr($('room-error'));
+  // 进入开始即占一个会话代次：两个 enterRoom 并发（如刷新自动重连与手动加入竞态）时，
+  // 先发起但后返回的流程在 await 之后复查代次，不再覆盖已进入的新房间。
+  const joinId = ++roomJoinSeq;
   const view = initialView || (await api('GET', `/api/rooms/${encodeURIComponent(code)}`));
+  if (roomJoinSeq !== joinId) return; // 等待期间又进入了别的房间：本流程作废
   const snap = await api('GET', `/api/versions/${view.version.id}`);
+  if (roomJoinSeq !== joinId) return;
   const cues = Engine.prepareCues(snap.cues);
   state.room = {
     view,
@@ -683,6 +695,7 @@ async function enterRoom(code, key, initialView) {
     progRows: null,
     // 校时锚点：以初始房间状态的服务端墙钟/时码为基准（本机单调时钟计时）
     clock: window.RoomClock.createClock(),
+    joinId,
     session: {
       id: snap.id,
       label: snap.label,
@@ -718,11 +731,41 @@ async function enterRoom(code, key, initialView) {
   document.querySelector('.tab[data-tab="room"]').click();
 }
 
-// 服务端状态 -> 重新锚定校时基准（每次成功的轮询/控制/编排/交接响应后调用）。
-// 仅记录响应里的服务端墙钟/时码与此刻的本机单调时刻；两次同步之间按单调流逝推进，
-// 设备墙钟快慢或被调整都不影响推算。
-function syncRoomClock(view) {
-  state.room.clock.sync(view);
+/**
+ * 统一的房间状态接纳入口（轮询 / 控制 / 编排 / 停点 / 预约 / 交接响应都走这里）。
+ * 仅当响应同时满足：
+ *   1) 属于当前房间会话——房间码与当前房间一致、且发起请求时捕获的 joinId 仍是
+ *      当前会话（离开房间、或重新加入后，旧在途响应全部丢弃，哪怕房间码相同）；
+ *   2) 不早于已接纳状态——按 (revision, server_wall) 偏序（RoomView）：修订号更大
+ *      必为更新；修订号相同再比服务端墙钟，自动启播/讨论停点/超载自动暂停/到末尾
+ *      不增修订号，同修订号下靠墙钟接纳合法的较新自动状态、拒绝迟到旧轮询回包；
+ *      成功控制（revision+1）后的状态绝不会被旧轮询回退。
+ * 才把响应写入 r.view 并重新锚定校时基准（clock.sync 只记录响应的服务端墙钟/时码与
+ * 此刻本机单调时刻；两次同步之间按单调流逝推进，设备墙钟快慢或被调整都不影响）。
+ * 返回 true 表示已接纳；false 表示已丢弃（视图与锚点保持现状）。
+ */
+function acceptRoomView(r, joinId, incoming) {
+  // 离开/换房/换会话后的迟到响应（joinId 不符或房间码不同），以及早于已接纳状态的
+  // 旧轮询/旧控制回包（同修订号但墙钟更早），一律丢弃：视图与锚点保持现状。
+  if (!window.RoomView.canApply(incoming, r.view, { code: r.view.code, joinId }, r.joinId)) {
+    return false;
+  }
+  r.view = incoming;
+  r.clock.sync(incoming);
+  return true;
+}
+
+// 接纳成功后刷新所有依赖房间状态的界面（速度选择框与各状态卡）。
+function refreshRoomPanels(r, syncSpeed = true) {
+  if (!r || r !== state.room) return; // 会话已结束：DOM 已由离开/新会话接管，不再触碰
+  if (syncSpeed) $('room-speed').value = String(r.view.speed);
+  renderRoomRole();
+  renderRoomProtection();
+  renderRoomHandover();
+  renderRoomProgram();
+  renderRoomStops();
+  renderRoomSchedule();
+  updateRoomHandoverCountdown();
 }
 
 // 循环排演：把“线性目标时码”映射为编排中的真实演出时码（与服务端同一份纯函数）。
@@ -794,25 +837,22 @@ function stopRoomLoop() {
   state.room.rafId = null;
 }
 
-// 轮询服务端状态：观看端按它校时，持有者也借此感知（多标签等）冲突后的新修订号
+// 轮询服务端状态：观看端按它校时，持有者也借此感知（多标签等）冲突后的新修订号。
+// 响应与控制回包并发到达，必须经 acceptRoomView 接纳：只接受仍属于本次房间会话、
+// 且不早于已接纳状态的响应（自动状态同修订号但墙钟更新仍采纳，旧回包丢弃）。
 async function pollRoom() {
-  if (!state.room) return;
+  const r = state.room;
+  if (!r) return;
+  const joinId = r.joinId;
+  const code = r.view.code;
   try {
-    const view = await api('GET', `/api/rooms/${encodeURIComponent(state.room.view.code)}`);
-    state.room.view = view;
-    syncRoomClock(view);
-    $('room-speed').value = String(view.speed);
-    renderRoomRole();
-    renderRoomProtection();
-    renderRoomHandover();
-    renderRoomProgram();
-    renderRoomStops();
-    renderRoomSchedule();
-    updateRoomHandoverCountdown();
+    const view = await api('GET', `/api/rooms/${encodeURIComponent(code)}`);
+    if (!acceptRoomView(state.room, joinId, view)) return; // 已离开/换会话，或迟到旧状态
+    refreshRoomPanels(state.room);
   } catch {
     /* 单次轮询失败不打断观看：保留最近一次有效状态与校时锚点，RAF 循环按单调
        流逝继续展示（播放/亮度/倒计时照常推进），下一周期重试；恢复后的响应
-       经 syncRoomClock 重新锚定，自动校准到服务端进度。 */
+       经 acceptRoomView 重新锚定，自动校准到服务端进度。 */
   }
 }
 
@@ -844,6 +884,7 @@ async function roomControl(action, extra = {}) {
   if (!r) return;
   if (!r.key) return showErr($('room-error'), '观看者不能控制房间：请在上方输入创建者的控制密钥。');
   clearErr($('room-error'));
+  const joinId = r.joinId;
   try {
     const view = await api('POST', `/api/rooms/${encodeURIComponent(r.view.code)}/control`, {
       control_key: r.key,
@@ -851,24 +892,22 @@ async function roomControl(action, extra = {}) {
       action,
       ...extra,
     });
-    r.view = view;
-    syncRoomClock(view);
-    $('room-speed').value = String(view.speed);
-    renderRoomRole();
-    renderRoomProtection();
-    renderRoomHandover();
-    renderRoomProgram();
-    renderRoomStops();
-    renderRoomSchedule();
+    // 成功控制也可能在途被更新的轮询抢先：按 (revision, server_wall) 统一排序，
+    // 绝不允许迟到旧回包把已接纳的新修订号/校时锚点回退
+    if (acceptRoomView(r, joinId, view)) refreshRoomPanels(r);
+    else if (state.room === r) $('room-speed').value = String(r.view.speed);
   } catch (err2) {
+    if (state.room !== r) return;
     if (err2.status === 409) {
       await pollRoom(); // 过期：按服务端最新状态校时后提示重试
+      if (state.room !== r) return;
     } else if (err2.status === 403) {
       // 密钥已失效（主持权已交给他人）：本浏览器降级为观看者，清掉旧密钥
       r.key = null;
       saveRoomKey(r.view.code, null);
       $('room-key-input').value = '';
       await pollRoom();
+      if (state.room !== r) return;
     } else {
       $('room-speed').value = String(r.view.speed); // 被拒绝（如非法速度）：回滚本地选择
     }
@@ -921,6 +960,7 @@ $('btn-room-leave').addEventListener('click', () => {
 
 function leaveRoom() {
   stopRoomLoop();
+  ++roomJoinSeq; // 作废本次会话所有在途响应：离开后迟到回包不得写进之后加入的房间
   state.room = null;
   $('room-workspace').hidden = true;
   $('room-lobby').hidden = false;
@@ -1082,27 +1122,25 @@ $('btn-room-prog-submit').addEventListener('click', async () => {
       return showErr($('room-program-error'), `第 ${i + 1} 段重复次数须为正整数。`);
     }
   }
+  const joinId = r.joinId;
   try {
     const view = await api('POST', `/api/rooms/${encodeURIComponent(r.view.code)}/program`, {
       control_key: r.key,
       revision: r.view.revision,
       segments,
     });
-    r.view = view;
-    syncRoomClock(view);
-    renderRoomRole();
-    renderRoomProtection();
-    renderRoomHandover();
-    renderRoomProgram();
-    renderRoomStops();
-    renderRoomSchedule();
+    if (acceptRoomView(r, joinId, view)) refreshRoomPanels(r);
   } catch (e) {
-    if (e.status === 409) await pollRoom();
-    else if (e.status === 403) {
+    if (state.room !== r) return;
+    if (e.status === 409) {
+      await pollRoom();
+      if (state.room !== r) return;
+    } else if (e.status === 403) {
       r.key = null;
       saveRoomKey(r.view.code, null);
       $('room-key-input').value = '';
       await pollRoom();
+      if (state.room !== r) return;
       renderRoomRole();
     }
     renderRoomProgram();
@@ -1118,21 +1156,19 @@ $('btn-room-prog-cancel').addEventListener('click', async () => {
   if (!r.key) return showErr($('room-program-error'), '观看者不能取消编排。');
   if (!r.view.program) return showErr($('room-program-error'), '当前没有进行中的循环排演。');
   clearErr($('room-program-error'));
+  const joinId = r.joinId;
   try {
     const view = await api('POST', `/api/rooms/${encodeURIComponent(r.view.code)}/program/clear`, {
       control_key: r.key,
       revision: r.view.revision,
     });
-    r.view = view;
-    syncRoomClock(view);
-    renderRoomRole();
-    renderRoomProtection();
-    renderRoomHandover();
-    renderRoomProgram();
-    renderRoomStops();
-    renderRoomSchedule();
+    if (acceptRoomView(r, joinId, view)) refreshRoomPanels(r);
   } catch (e) {
-    if (e.status === 409) await pollRoom();
+    if (state.room !== r) return;
+    if (e.status === 409) {
+      await pollRoom();
+      if (state.room !== r) return;
+    }
     renderRoomProgram();
     renderRoomSchedule();
     showErr($('room-program-error'), `取消循环排演失败：${e.message}`);
@@ -1253,28 +1289,26 @@ async function submitRoomStops(stops) {
   if (!r) return;
   if (!r.key) return showErr($('room-stops-error'), '观看者不能维护停点：请先输入控制密钥。');
   clearErr($('room-stops-error'));
+  const joinId = r.joinId;
   try {
     const view = await api('PUT', `/api/rooms/${encodeURIComponent(r.view.code)}/stops`, {
       control_key: r.key,
       revision: r.view.revision,
       stops,
     });
-    r.view = view;
-    syncRoomClock(view);
-    renderRoomRole();
-    renderRoomProtection();
-    renderRoomHandover();
-    renderRoomProgram();
-    renderRoomStops();
-    renderRoomSchedule();
+    if (acceptRoomView(r, joinId, view)) refreshRoomPanels(r);
   } catch (e) {
-    if (e.status === 409) await pollRoom();
-    else if (e.status === 403) {
+    if (state.room !== r) return;
+    if (e.status === 409) {
+      await pollRoom();
+      if (state.room !== r) return;
+    } else if (e.status === 403) {
       // 密钥已失效（主持权已交给他人）：本浏览器降级为观看者
       r.key = null;
       saveRoomKey(r.view.code, null);
       $('room-key-input').value = '';
       await pollRoom();
+      if (state.room !== r) return;
       renderRoomRole();
     }
     renderRoomStops();
@@ -1396,28 +1430,26 @@ async function submitRoomSchedule(startAtSec) {
   if (!r) return;
   if (!r.key) return showErr($('room-schedule-error'), '观看者不能预约定时启播：请先输入控制密钥。');
   clearErr($('room-schedule-error'));
+  const joinId = r.joinId;
   try {
     const view = await api('PUT', `/api/rooms/${encodeURIComponent(r.view.code)}/schedule`, {
       control_key: r.key,
       revision: r.view.revision,
       start_at: startAtSec,
     });
-    r.view = view;
-    syncRoomClock(view);
-    renderRoomRole();
-    renderRoomProtection();
-    renderRoomHandover();
-    renderRoomProgram();
-    renderRoomStops();
-    renderRoomSchedule();
+    if (acceptRoomView(r, joinId, view)) refreshRoomPanels(r);
   } catch (e) {
-    if (e.status === 409) await pollRoom();
-    else if (e.status === 403) {
+    if (state.room !== r) return;
+    if (e.status === 409) {
+      await pollRoom();
+      if (state.room !== r) return;
+    } else if (e.status === 403) {
       // 密钥已失效（主持权已交给他人）：本浏览器降级为观看者
       r.key = null;
       saveRoomKey(r.view.code, null);
       $('room-key-input').value = '';
       await pollRoom();
+      if (state.room !== r) return;
       renderRoomRole();
     }
     renderRoomSchedule();
@@ -1449,26 +1481,24 @@ $('btn-room-schedule-cancel').addEventListener('click', async () => {
     return showErr($('room-schedule-error'), '当前没有待生效的定时启播预约。');
   }
   clearErr($('room-schedule-error'));
+  const joinId = r.joinId;
   try {
     const view = await api('POST', `/api/rooms/${encodeURIComponent(r.view.code)}/schedule/cancel`, {
       control_key: r.key,
       revision: r.view.revision,
     });
-    r.view = view;
-    syncRoomClock(view);
-    renderRoomRole();
-    renderRoomProtection();
-    renderRoomHandover();
-    renderRoomProgram();
-    renderRoomStops();
-    renderRoomSchedule();
+    if (acceptRoomView(r, joinId, view)) refreshRoomPanels(r);
   } catch (e) {
-    if (e.status === 409) await pollRoom();
-    else if (e.status === 403) {
+    if (state.room !== r) return;
+    if (e.status === 409) {
+      await pollRoom();
+      if (state.room !== r) return;
+    } else if (e.status === 403) {
       r.key = null;
       saveRoomKey(r.view.code, null);
       $('room-key-input').value = '';
       await pollRoom();
+      if (state.room !== r) return;
       renderRoomRole();
     }
     renderRoomSchedule();
@@ -1489,26 +1519,33 @@ async function issueRoomHandover() {
   const r = state.room;
   if (!r || !r.key) return;
   clearErr($('room-error'));
+  const joinId = r.joinId;
   try {
     const d = await api('POST', `/api/rooms/${encodeURIComponent(r.view.code)}/handover/issue`, {
       control_key: r.key,
       revision: r.view.revision,
     });
-    r.view = d;
-    r.issuedToken = d.handover_token; // 仅本次显示，不写入 localStorage
-    r.issuedIssuedAt = d.handover && d.handover.issued_at ? d.handover.issued_at : null;
-    syncRoomClock(d);
-    renderRoomRole();
-    renderRoomHandover();
+    // 凭证仅本次显示、不写入 localStorage；仅当响应确被接纳（属于本会话且不旧于
+    // 已接纳状态）才记录——是否回显再由 renderRoomHandover 按视图 handover 块裁定。
+    const applied = acceptRoomView(r, joinId, d); // 发起不增修订号：同修订号下按墙钟定新旧
+    if (applied && state.room === r) {
+      r.issuedToken = d.handover_token;
+      r.issuedIssuedAt = d.handover && d.handover.issued_at ? d.handover.issued_at : null;
+      renderRoomRole();
+      renderRoomHandover();
+    }
   } catch (err2) {
+    if (state.room !== r) return;
     if (err2.status === 409) {
       await pollRoom();
+      if (state.room !== r) return;
     } else if (err2.status === 403) {
       // 密钥已失效（主持权已交给他人）：降级为观看者
       r.key = null;
       saveRoomKey(r.view.code, null);
       $('room-key-input').value = '';
       await pollRoom();
+      if (state.room !== r) return;
     }
     renderRoomRole();
     renderRoomHandover();
@@ -1521,24 +1558,31 @@ async function claimRoomHandover(token) {
   const r = state.room;
   if (!r) return;
   clearErr($('room-error'));
+  const joinId = r.joinId;
   try {
     const d = await api('POST', `/api/rooms/${encodeURIComponent(r.view.code)}/handover/claim`, {
       handover_token: token,
       revision: r.view.revision,
     });
-    // 新密钥仅显示这一次：保存到本地密钥库（刷新后仍可控制），页面给出醒目一次性提示
-    r.key = d.control_key;
+    // 新密钥仅显示这一次：先存本地密钥库（刷新后仍可控制）；页面提示只在响应被
+    // 当前会话接纳时展示。领取成功修订号 +1，偏序上必为更新，正常一定接纳。
     saveRoomKey(d.code, d.control_key);
-    r.claimedKey = d.control_key;
-    r.issuedToken = null;
-    r.issuedIssuedAt = null;
-    r.view = d;
-    syncRoomClock(d);
-    $('room-key-input').value = d.control_key;
-    renderRoomRole();
-    renderRoomHandover();
+    const applied = acceptRoomView(r, joinId, d);
+    if (applied && state.room === r) {
+      r.key = d.control_key;
+      r.claimedKey = d.control_key;
+      r.issuedToken = null;
+      r.issuedIssuedAt = null;
+      $('room-key-input').value = d.control_key;
+      refreshRoomPanels(r);
+      renderRoomHandover();
+    }
   } catch (err2) {
-    if (err2.status === 409) await pollRoom();
+    if (state.room !== r) return;
+    if (err2.status === 409) {
+      await pollRoom();
+      if (state.room !== r) return;
+    }
     showErr($('room-error'), `领取失败：${err2.message}`);
     renderRoomHandover();
   }
